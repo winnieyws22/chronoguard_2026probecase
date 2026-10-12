@@ -5,7 +5,8 @@ A general-purpose, point-in-time leakage guard for LLM agents.
 ChronoGuard runs any LLM agent as if it were operating at a specific past date,
 then measures how well that blinding actually holds. It's domain-agnostic and
 isn't tied to any agent framework. The primary target is local models served by
-[Ollama](https://ollama.com).
+[Ollama](https://ollama.com), and anything speaking the OpenAI
+chat-completions API works too (vLLM, LM Studio, llama.cpp, OpenRouter).
 
 ## Why two layers
 
@@ -14,7 +15,7 @@ need different fixes:
 
 | Channel | What happens | Fix |
 | --- | --- | --- |
-| **Tool leakage** | A tool (search, RAG store, API) hands back a document published after the as-of date. | Solvable. Intercept every tool call, filter results by timestamp. |
+| **Tool leakage** | A tool (search, RAG store, API) hands back a document published after the as-of date, or one edited after it. | Solvable. Intercept every tool call, filter results by timestamp. |
 | **Parametric leakage** | The weights already encode post-as-of facts, so the model answers correctly with zero tool access. | Not solvable by filtering. You can only measure it and pick a better model. |
 
 Something that does only the first and calls itself a sandbox is solving the
@@ -39,6 +40,19 @@ chronoguard models            # what's installed, and can it call tools natively
 chronoguard report "When will Halden ship Meridian, and what will it cost per seat?"
 ```
 
+Pointing it at your own data? Check the corpus first. This one needs no model at
+all, so it's the fastest way to find out whether a run can tell you anything:
+
+```bash
+chronoguard check corpus.json --as-of 2024-03-01T00:00:00Z --published-key created_utc
+```
+
+It reports what the guard would drop, and flags the two outcomes that waste a
+run: everything dropped (the agent gets no evidence, so it answers from its
+weights) and nothing dropped (the corpus never straddled the date, so a clean
+run proves nothing). It also names timestamp fields you haven't mapped, which is
+how an unmapped `last_modified` gets caught before it leaks.
+
 `chronoguard models` tells you which loop each model will drive:
 
 ```
@@ -62,10 +76,9 @@ RISK: ELEVATED
   - the model's training data runs past the simulated date (2024-08-01), so filtering cannot blind it
 
 TOOL LEAKAGE (contained by filtering)
-  2 tool call(s), 15 record(s) retrieved
-  kept 7, filtered 8  (allowed=7, future=5, undated=2, unparseable=1)
-    web_search          10 seen,   5 kept,   5 filtered
-    document_store       5 seen,   2 kept,   3 filtered
+  1 tool call(s), 3 record(s) retrieved
+  kept 2, filtered 1  (allowed=2, revised=1)
+    document_store       3 seen,   2 kept,   1 filtered
 
 PARAMETRIC LEAKAGE (measured, not contained)
   leakage 2/8 (25%), control 6/6 (100%), risk elevated
@@ -75,15 +88,23 @@ PARAMETRIC LEAKAGE (measured, not contained)
     nobel-peace-2023       expected 'Narges Mohammadi'
 
 CLAIMS IN THE ANSWER
-  6 claim(s): 5 grounded, 1 benign, 0 suspected leak(s), groundedness 100%
+  5 claim(s): 5 grounded, 0 benign, 0 suspected leak(s), groundedness 100%
+
+ANSWER
+  As of May 20th, 2023, there is no finalized ship date for Meridian and no
+  agreement on pricing per seat or depot.
 ```
 
 Read that carefully, because it's the case the project exists for. The filter
-worked: 8 of 15 retrieved records withheld. The answer is clean: every factual
-claim traces back to evidence, nothing leaked into the output. And the run still
-isn't `low`, because the same model asked directly with no documents at all
-hands over two facts from after the as-of date, and its training runs a year
-past the moment being simulated.
+worked, and the one record it withheld is the interesting kind: a launch FAQ
+created in February and quietly edited in October, whose current text gives away
+the ship date. Its creation date is clean. Filtering on that alone hands it
+straight to the agent.
+
+The answer is clean too: every factual claim traces back to evidence, nothing
+leaked into the output. And the run still isn't `low`, because the same model
+asked directly with no documents at all hands over two facts from after the
+as-of date, and its training runs a year past the moment being simulated.
 
 A tool that printed only the first and third sections would call this run fine.
 It wasn't fine, it was lucky.
@@ -118,6 +139,18 @@ web_search("meridian pricing")   # pre-as-of hits only
 audit.filtered_count             # what it didn't see
 ```
 
+`async def` tools work the same way, you just await the wrapped version.
+
+On a mutable source (a wiki, a CMS, a ticket tracker) map the revision field as
+well. A page created in 2022 and rewritten in 2024 has a 2022 creation date and
+2024 content, and filtering on the creation date alone walks it straight past
+the guard:
+
+```python
+MappingAdapter(source_key="page_id", published_key="created_at",
+               updated_key="last_modified")
+```
+
 Then run the whole pipeline:
 
 ```python
@@ -130,13 +163,32 @@ report.render()           # the text report
 report.summary()          # the JSON summary
 ```
 
+## In CI
+
+Both commands can fail a build. Off by default, so adding the flag is the only
+thing that changes behaviour:
+
+```bash
+# does my corpus still straddle the as-of date? no model needed
+chronoguard check corpus.json --as-of 2024-03-01T00:00:00Z --fail-on error
+
+# do any probe questions still apply at this date? also no model
+chronoguard cases --as-of 2024-03-01T00:00:00Z --fail-on error
+
+# did this change make the run leakier?
+chronoguard report "$TASK" --fail-on elevated --json-out summary.json
+```
+
+Exit `0` fine, `1` no Ollama, `2` bad argument, `3` threshold hit. The report is
+printed and `--json-out` written before the threshold is checked, because the run
+that failed the build is the one you need to read.
+
 ## Docs
 
 - **[docs/guide.md](docs/guide.md)** walks through every layer with examples.
 - **[docs/configuration.md](docs/configuration.md)** is the full option reference.
 - **[docs/interpreting-reports.md](docs/interpreting-reports.md)** covers what a
   verdict means and what to do about it.
-- **[DESIGN.md](DESIGN.md)** is the argument the whole thing is built on.
 - **[examples/](examples/)** has a worked end-to-end scenario on your own corpus.
 - **[docs/kb/](docs/kb/INDEX.md)** is a knowledge base for agents working in this
   repo: atomic notes, cross-linked, loadable a few at a time.
@@ -163,8 +215,20 @@ probe's controls passed, so the tests can't go green because nothing happened.
 ## Status
 
 Working end to end, and early. The filter, interception, agent runner, probe,
-claim classifier and reporting are all in place with tests. See
-[PLAN.md](PLAN.md) for how it was built and what each phase covers.
+claim classifier and reporting are all in place with tests.
+
+New in 0.2.0:
+
+- **Revision filtering.** A page published before the as-of date and edited
+  after it is now rejected. Filtering on the creation date alone is how a 2022
+  wiki page rewritten in 2024 reaches the agent.
+- **Async tools.** Wrapping an `async def` works; you await the guarded version.
+- **`chronoguard check` and `chronoguard cases`.** Two commands that need no
+  model at all, for finding out whether your corpus and your probe questions can
+  support a run before you spend one.
+- **`--fail-on`.** Both of those, and `report`, can fail a build.
+- **Other backends.** Anything speaking the OpenAI chat-completions API, so
+  vLLM, LM Studio, llama.cpp and the hosted APIs all work.
 
 ## License
 

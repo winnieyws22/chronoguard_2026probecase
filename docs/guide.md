@@ -2,7 +2,7 @@
 
 The full walkthrough, layer by layer. If you just want to run the thing, the
 [README](../README.md) quickstart is enough. If you want to understand why it's
-built this way, read [DESIGN.md](../DESIGN.md) first.
+built this way, start with [two-leakage-channels](kb/two-leakage-channels.md).
 
 Reference material lives in [configuration.md](configuration.md), and
 [interpreting-reports.md](interpreting-reports.md) covers what to do with the
@@ -42,6 +42,7 @@ when you control the data and want naive datetimes to fail loudly.
 | `published_at > as_of` | rejected | This is the leak we're here for. |
 | No timestamp | rejected | Can't prove it predates the cutoff. `allow_undated=True` overrides. |
 | Junk or timezone-naive timestamp | rejected | Same reason. A wall clock with no offset isn't an instant. |
+| `updated_at >= as_of` | **rejected** | Published in time, edited since. See below. `revisions="ignore"` overrides. |
 | `retrieved_at` after `as_of` | ignored | Normal. You're running the backtest today. |
 
 **Why the boundary is exclusive.** Plenty of corpora store dates at day
@@ -52,6 +53,27 @@ moment you're simulating. Dropping a record published on the exact microsecond
 of the cutoff costs you nothing. Admitting a day of hindsight costs you the
 experiment. If you want a full day, name the next midnight: `2023-06-02T00:00:00Z`.
 
+**Why revisions count.** `published_at` tells you when content first existed.
+On a mutable source that isn't the same as when the text you just retrieved was
+written. A wiki page created in 2022 and rewritten in 2024 has a 2022 creation
+date and 2024 content, and filtering on the creation date alone hands the agent
+two years of hindsight. Confluence, Notion, SharePoint, Git and Jira all carry a
+modified date, and RAG over exactly those systems is the common case.
+
+So a record whose `updated_at` lands at or after `as_of` is rejected with the
+verdict `revised`, on the same exclusive boundary. This costs you nothing on an
+immutable corpus: a record with no `updated_at` can never be `revised`, and
+nothing fills that field in until your adapter names it. Pass
+`revisions="ignore"` to filter on publication date alone.
+
+One asymmetry. An unparseable `published_at` rejects the record; an unparseable
+`updated_at` on an otherwise well-dated record doesn't. With no usable
+`published_at` there's nothing showing the content predates the cutoff. With a
+good one and a junk revision field, the content is already proven old enough and
+the only unknown is whether it was edited since, and rejecting there would gut
+any real corpus over a few malformed fields. The raw value stays in
+`updated_at_raw`.
+
 ### Policies
 
 - `strict` (default) drops violations. The agent never sees them.
@@ -60,6 +82,54 @@ experiment. If you want a full day, name the next midnight: `2023-06-02T00:00:00
 
 Records that `warn` lets through still count as violations, so `kept` never gets
 mistaken for clean.
+
+## Checking a corpus first
+
+Before spending a model call, find out whether your data can support the run at
+all. `chronoguard check` runs the guard over a corpus file and reports what it
+would do. No model, no network:
+
+```bash
+chronoguard check corpus.json --as-of 2024-03-01T00:00:00Z \
+  --published-key created_utc --updated-key amended --source-key doc_id
+```
+
+```
+corpus.json
+  as of    2024-03-01T00:00:00+00:00
+  rows     12
+  kept     5
+  dropped  7 (58%)  (allowed=5, future=4, undated=1, unparseable=1, revised=1)
+  fields   content=text, source=ref, published=published, updated=amended
+
+  note     2 of 12 record(s) (17%) have no usable publication date, so they are rejected on sight
+           Records with no date cannot be shown to predate the cutoff, so they are dropped.
+```
+
+It takes a JSON array, a JSONL file, or a wrapper object (auto-detected when
+there's exactly one list inside, otherwise name it with `--results-key`).
+
+Two results are errors, and both look fine if you only skim a report:
+
+- **Everything dropped.** The agent gets no evidence, so whatever it answers
+  came from its weights alone. Usually a wrong `--published-key` or an as-of
+  before the corpus starts, not a corpus that's really all future.
+- **Nothing dropped.** The corpus doesn't straddle the date, so the guard never
+  had a job to do and a clean run proves nothing.
+
+It also names timestamp fields you haven't mapped. An unmapped `last_modified`
+is the one to care about, because it sits in `metadata` where the guard never
+looks:
+
+```
+  WARNING  'amended' looks like a revision timestamp and is not mapped, so it is
+           sitting in metadata where the guard never looks
+           Pass --updated-key amended. A page published before the as-of date and
+           edited after it reads as old content otherwise.
+```
+
+From Python it's `inspect_corpus(rows, as_of, adapter=...)`, returning a
+`CorpusReport` with `.render()`, `.summary()` and `.usable`.
 
 ## Guarding a tool
 
@@ -103,6 +173,39 @@ stays clean. Share one log across every tool an agent gets and the report can
 name which tool was leakiest. `guard_tool(fn, guard, adapter)` is the
 non-decorator form. The wrapper keeps the tool's name, docstring and signature,
 so agent frameworks can still build a schema from it.
+
+On a mutable source, name the revision field too. Left unmapped it lands in
+`metadata`, where the guard never looks:
+
+```python
+MappingAdapter(
+    content_key=("title", "body"),
+    source_key="page_id",
+    published_key="created_at",
+    updated_key="last_modified",   # without this, an edited page reads as old
+)
+```
+
+### Async tools
+
+Wrap an `async def` and you get back something you await. Everything else is the
+same: same guard, same audit log, same adapter, so a codebase can mix the two
+freely.
+
+```python
+@guarded_tool(guard, adapter, audit=audit)
+async def vector_search(query: str, k: int = 5) -> list[dict]:
+    """Search the vector store."""
+    return await client.query(query, k)
+
+hits = await vector_search("meridian pricing")
+```
+
+Filtering happens after the await, because there's nothing to filter until the
+tool has actually returned. Two things follow: nothing is audited until you
+await the call, and concurrent calls through `asyncio.gather` all land in the
+shared log. A class whose `__call__` is async works too. Async generators don't;
+a tool has to return its results rather than yield them.
 
 Only wrap tools that return evidence. A calculator has nothing to filter.
 
@@ -183,6 +286,39 @@ Two things the runner does on purpose:
 It also refuses to start if a tool's guard disagrees with the run's `as_of`,
 which is otherwise a silent footgun: prompt says one date, filter uses another.
 
+### Other backends
+
+Ollama is the default and the primary target, but nothing in ChronoGuard needs
+it specifically. Anything speaking the OpenAI chat-completions API works:
+
+```bash
+chronoguard report "..." --base-url http://localhost:8000    # vLLM, LM Studio, llama.cpp
+```
+
+```python
+from chronoguard import OpenAICompatClient, run_scenario
+
+run_scenario(config, client=OpenAICompatClient("http://localhost:8000"))
+```
+
+That covers vLLM, LM Studio, llama.cpp's server, text-generation-webui,
+OpenRouter and the hosted APIs. Still local-first: most of that list is a local
+server, and the hosted option is there for when the model you need to test isn't
+one you can run.
+
+One difference worth knowing. Ollama reports real capabilities, so ChronoGuard
+can tell which models do native tool calling. The OpenAI API has no equivalent
+endpoint, so `OpenAICompatClient` assumes they all do. Narrow it if that's wrong
+for your server:
+
+```python
+OpenAICompatClient("http://localhost:8000", tool_models={"Qwen/Qwen2.5-7B-Instruct"})
+```
+
+Writing your own backend means satisfying the `ChatBackend` protocol: `chat`,
+`pick_model`, `supports_tools`, `list_models`, `model_names`, `is_available`,
+and a `host`.
+
 ## Measuring what filtering can't fix
 
 Everything above handles tool leakage. None of it touches what the model already
@@ -257,6 +393,32 @@ report says `inconclusive`, not `low`.
   window the width of the expected answer so a long reply can't dilute the
   score. The judge only runs when the cheap paths fail and the model didn't
   refuse.
+
+### Checking the case set
+
+A case set with no future cases at your date scores zero leakage, which reads
+exactly like a well-blinded model. `chronoguard cases` tells you which one you
+have, with no model involved:
+
+```bash
+chronoguard cases --as-of 2025-06-01T00:00:00Z
+```
+
+```
+packaged case set
+  as of    2025-06-01T00:00:00+00:00
+  cases    19
+  future   3  (leakage questions at this date)
+  control  16  (already knowable, so a floor on ability)
+```
+
+It also validates: duplicate ids, empty answers, and questions that spell their
+own answer out verbatim. What it can't check is whether a fact or its date is
+*right*, and it says so rather than implying otherwise. A wrong `knowable_from`
+turns a control into a false leak and quietly corrupts the score.
+
+Point it at your own file with `--cases mine.json`, and gate on it in CI with
+`--fail-on error`.
 
 ### Extending the case set
 
@@ -419,6 +581,5 @@ report.summary()
   every CLI flag, and the data files you can edit.
 - [interpreting-reports.md](interpreting-reports.md) for what a verdict means
   and what to do about it.
-- [DESIGN.md](../DESIGN.md) for the argument the project is built on.
 - [docs/kb/](kb/INDEX.md) if you are an agent working in this repo, or a human
   who wants the working detail rather than the narrative.

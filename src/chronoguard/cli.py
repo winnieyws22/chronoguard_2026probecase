@@ -13,10 +13,58 @@ from chronoguard._version import __version__
 from chronoguard.agent import AgentConfig, run_agent
 from chronoguard.fixtures import FIXTURE_AS_OF, build_fixture_toolset
 from chronoguard.guard import GuardPolicy, TemporalGuard
-from chronoguard.interception import AuditLog
-from chronoguard.ollama import OllamaClient, OllamaTimeout, OllamaUnavailable
-from chronoguard.probe import LeakageProbe, load_model_cutoffs, load_probe_cases
-from chronoguard.report import ScenarioConfig, run_scenario
+from chronoguard.interception import AuditLog, MappingAdapter
+from chronoguard.backends import (
+    BackendTimeout,
+    BackendUnavailable,
+    ChatBackend,
+    OpenAICompatClient,
+)
+from chronoguard.ollama import OllamaClient, OllamaUnavailable
+from chronoguard.preflight import inspect_corpus, load_rows
+from chronoguard.probe import (
+    LeakageProbe,
+    describe_cases,
+    load_model_cutoffs,
+    load_probe_cases,
+)
+from chronoguard.report import RISK_ORDER, ScenarioConfig, risk_at_least, run_scenario
+
+#: What the shell sees. Documented so a CI job can branch on them.
+EXIT_OK = 0
+EXIT_INFRASTRUCTURE = 1
+"""No Ollama server, no models installed."""
+EXIT_BAD_ARGUMENT = 2
+"""An as_of with no offset, an unreadable corpus, an unknown policy."""
+EXIT_THRESHOLD = 3
+"""The run completed and --fail-on said this result is not acceptable."""
+
+#: Backends the CLI can build. The library takes any ChatBackend.
+BACKENDS = ("ollama", "openai-compat")
+
+
+def _resolve(name: str, host: str | None, base_url: str | None) -> ChatBackend:
+    """Build the requested backend.
+
+    Passing --base-url selects openai-compat on its own, because naming an
+    OpenAI API root and then getting an Ollama client is never what anyone
+    meant.
+    """
+    if base_url and name == "ollama":
+        name = "openai-compat"
+    if name == "ollama":
+        return OllamaClient(host=host)
+    if name == "openai-compat":
+        return OpenAICompatClient(base_url or host)
+    raise typer.BadParameter(f"--backend must be one of {', '.join(BACKENDS)}, got {name!r}")
+
+
+#: --fail-on values for `check`, mapped to which severities trip them.
+_CHECK_SEVERITIES = {
+    "never": lambda severity: False,
+    "error": lambda severity: severity == "error",
+    "warning": lambda severity: severity in ("error", "warning"),
+}
 
 app = typer.Typer(
     name="chronoguard",
@@ -24,7 +72,8 @@ app = typer.Typer(
         "Run LLM agents as if it were a past date, and measure how well the "
         "blinding holds.\n\n"
         "ChronoGuard filters tool results by publication date (tool leakage) "
-        "and probes the model for facts it already knows (parametric leakage)."
+        "and probes the model for facts it already knows (parametric leakage).\n\n"
+        "Exit codes: 0 fine, 1 no Ollama, 2 bad argument, 3 --fail-on threshold hit."
     ),
     no_args_is_help=True,
     add_completion=False,
@@ -59,19 +108,177 @@ def version() -> None:
 
 
 @app.command()
+def check(
+    corpus: Annotated[str, typer.Argument(help="JSON or JSONL file holding your records.")],
+    as_of: Annotated[
+        str, typer.Option("--as-of", help="The instant to simulate. Needs a timezone offset.")
+    ] = FIXTURE_AS_OF,
+    published_key: Annotated[
+        Optional[str], typer.Option(help="Field holding the publication timestamp.")
+    ] = None,
+    updated_key: Annotated[
+        Optional[str], typer.Option(help="Field holding the last-revision timestamp.")
+    ] = None,
+    source_key: Annotated[Optional[str], typer.Option(help="Field holding a stable id.")] = None,
+    content_key: Annotated[Optional[str], typer.Option(help="Field holding the text.")] = None,
+    results_key: Annotated[
+        Optional[str], typer.Option(help="Key to dig into when the file is a wrapper object.")
+    ] = None,
+    policy: Annotated[str, typer.Option(help="strict or warn.")] = "strict",
+    revisions: Annotated[str, typer.Option(help="reject or ignore.")] = "reject",
+    allow_undated: Annotated[
+        bool, typer.Option("--allow-undated", help="Admit records with no usable date.")
+    ] = False,
+    fail_on: Annotated[
+        str,
+        typer.Option(
+            help="Exit 3 when a finding reaches this severity: error, warning, or never."
+        ),
+    ] = "never",
+    as_json: Annotated[bool, typer.Option("--json", help="Emit the report as JSON.")] = False,
+) -> None:
+    """Show what the guard would do to a corpus, without running a model.
+
+    No Ollama, no network. Point it at your data before you spend a model call,
+    because the two states that waste a run (everything dropped, nothing
+    dropped) both look fine from a distance.
+    """
+    if fail_on not in _CHECK_SEVERITIES:
+        typer.secho(
+            f"--fail-on must be one of {', '.join(_CHECK_SEVERITIES)}, got {fail_on!r}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT)
+
+    try:
+        guard = TemporalGuard(
+            as_of,
+            policy=GuardPolicy(policy),
+            allow_undated=allow_undated,
+            revisions=revisions,
+        )
+        rows = load_rows(corpus, results_key=results_key)
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT) from exc
+
+    adapter = MappingAdapter(
+        results_key=None,
+        **{
+            key: value
+            for key, value in (
+                ("content_key", content_key),
+                ("source_key", source_key),
+                ("published_key", published_key),
+                ("updated_key", updated_key),
+            )
+            if value
+        },
+    )
+
+    report = inspect_corpus(rows, as_of, adapter=adapter, guard=guard, source=corpus)
+
+    if as_json:
+        typer.echo(json.dumps(report.summary(), indent=2))
+    else:
+        typer.echo(report.render())
+        if report.errors:
+            typer.echo("")
+            typer.secho("This corpus would not produce a meaningful run.", fg=typer.colors.RED)
+
+    breached = [f for f in report.findings if _CHECK_SEVERITIES[fail_on](f.severity)]
+    if breached:
+        typer.secho(
+            f"\n--fail-on {fail_on}: {len(breached)} finding(s) at or above that severity.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_THRESHOLD)
+
+
+@app.command()
+def cases(
+    as_of: Annotated[
+        str, typer.Option("--as-of", help="The instant to simulate. Needs a timezone offset.")
+    ] = FIXTURE_AS_OF,
+    file: Annotated[
+        Optional[str],
+        typer.Option("--cases", help="Your own case file. Defaults to the packaged set."),
+    ] = None,
+    fail_on: Annotated[
+        str,
+        typer.Option(
+            help="Exit 3 when an issue reaches this severity: error, warning, or never."
+        ),
+    ] = "never",
+    as_json: Annotated[bool, typer.Option("--json", help="Emit the report as JSON.")] = False,
+) -> None:
+    """Show how many probe questions actually apply at --as-of, and validate the set.
+
+    A case set with no future cases at your date scores zero leakage, which
+    reads exactly like a well-blinded model. This tells you which one you have.
+    No model needed.
+    """
+    if fail_on not in _CHECK_SEVERITIES:
+        typer.secho(
+            f"--fail-on must be one of {', '.join(_CHECK_SEVERITIES)}, got {fail_on!r}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT)
+
+    try:
+        report = describe_cases(
+            load_probe_cases(file),
+            as_of,
+            source=file or "packaged case set",
+        )
+    except (OSError, ValueError, ValidationError) as exc:
+        typer.secho(_first_error(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT) from exc
+
+    if as_json:
+        typer.echo(json.dumps(report.summary(), indent=2))
+    else:
+        typer.echo(report.render())
+        if not report.usable:
+            typer.echo("")
+            typer.secho(
+                "A probe at this date would not measure anything.", fg=typer.colors.RED
+            )
+
+    breached = [i for i in report.issues if _CHECK_SEVERITIES[fail_on](i.severity)]
+    if breached:
+        typer.secho(
+            f"\n--fail-on {fail_on}: {len(breached)} issue(s) at or above that severity.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_THRESHOLD)
+
+
+@app.command()
 def models(
     host: Annotated[Optional[str], typer.Option(help="Ollama host. Defaults to OLLAMA_HOST.")] = None,
+    backend: Annotated[
+        str, typer.Option(help="ollama or openai-compat.")
+    ] = "ollama",
+    base_url: Annotated[
+        Optional[str],
+        typer.Option(help="Root of an OpenAI-compatible API. Implies --backend openai-compat."),
+    ] = None,
 ) -> None:
-    """List locally installed Ollama models and whether they can call tools."""
+    """List the models a backend is offering, and whether they can call tools."""
     try:
-        client = OllamaClient(host=host)
+        client = _resolve(backend, host, base_url)
         installed = client.list_models()
-    except OllamaUnavailable as exc:
+    except BackendUnavailable as exc:
         raise _die(exc) from exc
 
     if not installed:
-        typer.echo(f"No models installed on {client.host}. Try `ollama pull gemma3:4b`.")
-        raise typer.Exit(code=1)
+        typer.echo(f"No models offered by {client.host}. Try `ollama pull gemma3:4b`.")
+        raise typer.Exit(code=EXIT_INFRASTRUCTURE)
 
     typer.echo(f"{len(installed)} model(s) on {client.host}:\n")
     for model in installed:
@@ -95,6 +302,13 @@ def run(
         str, typer.Option(help="strict drops post-as-of evidence, warn keeps and flags it.")
     ] = "strict",
     host: Annotated[Optional[str], typer.Option(help="Ollama host.")] = None,
+    backend: Annotated[
+        str, typer.Option(help="ollama or openai-compat.")
+    ] = "ollama",
+    base_url: Annotated[
+        Optional[str],
+        typer.Option(help="Root of an OpenAI-compatible API. Implies --backend openai-compat."),
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Emit the run as JSON.")] = False,
 ) -> None:
     """Run one agent task against the fixture corpora, guarded at --as-of.
@@ -107,7 +321,7 @@ def run(
         guard = TemporalGuard(as_of, policy=GuardPolicy(policy))
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT) from exc
 
     tools = build_fixture_toolset(guard, AuditLog())
     config = AgentConfig(
@@ -115,8 +329,8 @@ def run(
     )
 
     try:
-        result = run_agent(config, tools, client=OllamaClient(host=host))
-    except OllamaUnavailable as exc:
+        result = run_agent(config, tools, client=_resolve(backend, host, base_url))
+    except BackendUnavailable as exc:
         raise _die(exc) from exc
 
     if as_json:
@@ -165,6 +379,13 @@ def probe(
         Optional[int], typer.Option(help="Cap on control questions asked.")
     ] = None,
     host: Annotated[Optional[str], typer.Option(help="Ollama host.")] = None,
+    backend: Annotated[
+        str, typer.Option(help="ollama or openai-compat.")
+    ] = "ollama",
+    base_url: Annotated[
+        Optional[str],
+        typer.Option(help="Root of an OpenAI-compatible API. Implies --backend openai-compat."),
+    ] = None,
     as_json: Annotated[bool, typer.Option("--json", help="Emit the report as JSON.")] = False,
 ) -> None:
     """Measure what a model already knows about the future, with no tools at all.
@@ -173,7 +394,7 @@ def probe(
     weights, not from anything you handed it.
     """
     try:
-        client = OllamaClient(host=host)
+        client = _resolve(backend, host, base_url)
         chosen = model or client.pick_model()
         report = LeakageProbe(
             client,
@@ -181,11 +402,11 @@ def probe(
             cutoffs=load_model_cutoffs(cutoffs) if cutoffs else None,
             judge_model=judge,
         ).run(chosen, as_of, max_future_cases=max_future, max_control_cases=max_control)
-    except OllamaUnavailable as exc:
+    except BackendUnavailable as exc:
         raise _die(exc) from exc
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT) from exc
 
     if as_json:
         payload = report.model_dump(mode="json")
@@ -250,16 +471,40 @@ def report(
     json_out: Annotated[
         Optional[str], typer.Option("--json-out", help="Also write the JSON summary to this path.")
     ] = None,
+    fail_on: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "Exit 3 when the headline risk reaches this level: "
+                "low, unknown, elevated, high, or never."
+            )
+        ),
+    ] = "never",
     as_json: Annotated[
         bool, typer.Option("--json", help="Print the JSON summary instead of the text report.")
     ] = False,
     host: Annotated[Optional[str], typer.Option(help="Ollama host.")] = None,
+    backend: Annotated[
+        str, typer.Option(help="ollama or openai-compat.")
+    ] = "ollama",
+    base_url: Annotated[
+        Optional[str],
+        typer.Option(help="Root of an OpenAI-compatible API. Implies --backend openai-compat."),
+    ] = None,
 ) -> None:
     """Run a full scenario: agent run, leakage probe, claim classification.
 
     Prints a human-readable report and, with --json-out, writes the machine
     summary alongside it.
     """
+    if fail_on != "never" and fail_on not in RISK_ORDER:
+        typer.secho(
+            f"--fail-on must be never or one of {', '.join(RISK_ORDER)}, got {fail_on!r}",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT)
+
     try:
         config = ScenarioConfig(
             task=task,
@@ -277,11 +522,11 @@ def report(
         )
     except (ValueError, ValidationError) as exc:
         typer.secho(_first_error(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
+        raise typer.Exit(code=EXIT_BAD_ARGUMENT) from exc
 
     try:
-        result = run_scenario(config, client=OllamaClient(host=host))
-    except OllamaUnavailable as exc:
+        result = run_scenario(config, client=_resolve(backend, host, base_url))
+    except BackendUnavailable as exc:
         raise _die(exc) from exc
 
     summary = result.summary()
@@ -295,13 +540,29 @@ def report(
         if json_out:
             typer.echo(f"\nJSON summary written to {json_out}")
 
+    if fail_on != "never" and risk_at_least(result.headline_risk, fail_on):
+        typer.secho(
+            f"\n--fail-on {fail_on}: this run came back {result.headline_risk}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_THRESHOLD)
 
-def _die(exc: OllamaUnavailable) -> typer.Exit:
-    """Report an Ollama failure with advice that matches what actually went wrong."""
+
+def _die(exc: BackendUnavailable) -> typer.Exit:
+    """Report a backend failure with advice that matches what actually went wrong.
+
+    A timeout means the server is up and the model is slow, so telling anyone to
+    start a server is wrong. Everything else gets start-up advice, specific to
+    Ollama when that is what failed and generic when it is some other backend.
+    """
     typer.secho(str(exc), fg=typer.colors.RED, err=True)
-    if not isinstance(exc, OllamaTimeout):
-        typer.echo("Start one with `ollama serve`.", err=True)
-    return typer.Exit(code=1)
+    if not isinstance(exc, BackendTimeout):
+        if isinstance(exc, OllamaUnavailable):
+            typer.echo("Start one with `ollama serve`.", err=True)
+        else:
+            typer.echo("Check the server is running and --base-url is right.", err=True)
+    return typer.Exit(code=EXIT_INFRASTRUCTURE)
 
 
 def _first_error(exc: Exception) -> str:

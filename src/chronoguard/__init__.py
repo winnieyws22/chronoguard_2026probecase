@@ -3,7 +3,7 @@
 ChronoGuard runs an LLM agent as if it were operating at a past date, then
 measures how well that blinding actually holds.
 
-Two separate leakage channels, handled separately (see DESIGN.md):
+Two separate leakage channels, handled separately (see docs/kb/two-leakage-channels.md):
 
 * **Tool leakage**: the agent retrieves evidence published after the as-of date.
   Fixable by filtering, which is `chronoguard.evidence` and `chronoguard.guard`.
@@ -29,6 +29,12 @@ Wrap a tool so the agent can only ever see the survivors::
     @guarded_tool(guard, MappingAdapter(source_key="url", published_key="date"))
     def web_search(query: str) -> list[dict]:
         ...
+
+`async def` tools work the same way, you just await the wrapped version. On a
+mutable source, name the revision field too, or a page written in 2022 and
+rewritten in 2024 counts as 2022 content::
+
+    MappingAdapter(source_key="url", published_key="date", updated_key="modified")
 """
 
 from chronoguard._version import __version__
@@ -45,6 +51,7 @@ from chronoguard.guard import (
     FilterResult,
     GuardPolicy,
     Judgement,
+    RevisionPolicy,
     TemporalGuard,
     Verdict,
     guard_records,
@@ -59,13 +66,23 @@ from chronoguard.interception import (
     guard_tool,
     guarded_tool,
 )
+from chronoguard.backends import (
+    BackendTimeout,
+    BackendUnavailable,
+    ChatBackend,
+    OpenAICompatClient,
+)
 from chronoguard.ollama import OllamaClient, OllamaUnavailable
+from chronoguard.preflight import CorpusReport, inspect_corpus, load_rows
 from chronoguard.probe import (
+    CaseIssue,
+    CaseSetReport,
     CutoffRisk,
     LeakageProbe,
     ModelCutoffs,
     ProbeCase,
     ProbeReport,
+    describe_cases,
     load_model_cutoffs,
     load_probe_cases,
 )
@@ -76,10 +93,16 @@ __all__ = [
     "AgentRun",
     "AgentRunner",
     "AuditLog",
+    "BackendTimeout",
+    "BackendUnavailable",
+    "CaseIssue",
+    "CaseSetReport",
+    "ChatBackend",
     "Claim",
     "ClaimClassifier",
     "ClaimLabel",
     "ClaimReport",
+    "CorpusReport",
     "CutoffRisk",
     "EvidenceAdapter",
     "EvidenceRecord",
@@ -92,9 +115,11 @@ __all__ = [
     "ModelCutoffs",
     "OllamaClient",
     "OllamaUnavailable",
+    "OpenAICompatClient",
     "ProbeCase",
     "ProbeReport",
     "RecordAdapter",
+    "RevisionPolicy",
     "ScenarioConfig",
     "ScenarioReport",
     "TemporalGuard",
@@ -102,11 +127,14 @@ __all__ = [
     "Verdict",
     "__version__",
     "classify_run",
+    "describe_cases",
     "guard_records",
     "guard_tool",
     "guarded_tool",
+    "inspect_corpus",
     "load_model_cutoffs",
     "load_probe_cases",
+    "load_rows",
     "parse_timestamp",
     "run_agent",
     "run_scenario",

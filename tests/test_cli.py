@@ -318,3 +318,450 @@ class TestOllamaErrorAdvice:
         result = runner.invoke(app, command)
         assert result.exit_code == 1
         assert "ollama serve" in plain(result)
+
+
+class TestCheckCommand:
+    """`chronoguard check` is the one command that never needs a model."""
+
+    AS_OF = "2023-06-01T00:00:00Z"
+    BEFORE = "2023-01-15T00:00:00Z"
+    AFTER = "2023-09-15T00:00:00Z"
+
+    def corpus(self, tmp_path, rows, name="corpus.json"):
+        path = tmp_path / name
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        return str(path)
+
+    def straddling(self, tmp_path):
+        return self.corpus(tmp_path, [
+            {"id": "a", "content": "old", "published_at": self.BEFORE},
+            {"id": "b", "content": "old", "published_at": self.BEFORE},
+            {"id": "c", "content": "new", "published_at": self.AFTER},
+        ])
+
+    def test_it_runs_with_no_ollama_at_all(self, tmp_path, monkeypatch) -> None:
+        # The point of the command. Make any Ollama call explode so a
+        # regression that reintroduces one fails loudly.
+        def boom(*args, **kwargs):
+            raise AssertionError("check must not touch Ollama")
+
+        monkeypatch.setattr(cli.OllamaClient, "__init__", boom)
+        result = runner.invoke(app, ["check", self.straddling(tmp_path), "--as-of", self.AS_OF])
+        assert result.exit_code == 0
+
+    def test_it_reports_the_counts(self, tmp_path) -> None:
+        result = runner.invoke(app, ["check", self.straddling(tmp_path), "--as-of", self.AS_OF])
+        out = plain(result)
+        assert "rows     3" in out
+        assert "kept     2" in out
+        assert "dropped  1" in out
+
+    def test_json_output_parses(self, tmp_path) -> None:
+        result = runner.invoke(
+            app, ["check", self.straddling(tmp_path), "--as-of", self.AS_OF, "--json"]
+        )
+        payload = json.loads(plain(result))
+        assert payload["kept"] == 2
+        assert payload["usable"] is True
+
+    def test_a_missing_file_exits_two(self, tmp_path) -> None:
+        result = runner.invoke(app, ["check", str(tmp_path / "nope.json")])
+        assert result.exit_code == 2
+
+    def test_a_bad_as_of_exits_two(self, tmp_path) -> None:
+        result = runner.invoke(app, ["check", self.straddling(tmp_path), "--as-of", "2023-06-01"])
+        assert result.exit_code == 2
+
+    def test_an_all_past_corpus_says_the_run_proves_nothing(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, [{"id": "a", "content": "x", "published_at": self.BEFORE}])
+        out = plain(runner.invoke(app, ["check", path, "--as-of", self.AS_OF]))
+        assert "drops nothing" in out
+        assert "would not produce a meaningful run" in out
+
+    def test_custom_field_names_are_honoured(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, [
+            {"ref": "a", "body": "x", "issued": self.BEFORE},
+            {"ref": "b", "body": "y", "issued": self.AFTER},
+        ])
+        out = plain(runner.invoke(app, [
+            "check", path, "--as-of", self.AS_OF,
+            "--published-key", "issued", "--source-key", "ref", "--content-key", "body",
+        ]))
+        assert "kept     1" in out
+        assert "published=issued" in out
+
+    def test_an_unmapped_revision_field_is_flagged(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE, "last_modified": self.AFTER},
+            {"id": "b", "content": "y", "published_at": self.BEFORE, "last_modified": self.AFTER},
+            {"id": "c", "content": "z", "published_at": self.AFTER, "last_modified": self.AFTER},
+        ])
+        out = plain(runner.invoke(app, ["check", path, "--as-of", self.AS_OF]))
+        assert "--updated-key last_modified" in out
+
+    def test_mapping_the_revision_field_changes_the_verdict(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE, "mod": self.AFTER},
+            {"id": "b", "content": "y", "published_at": self.BEFORE, "mod": self.BEFORE},
+        ])
+        args = ["check", path, "--as-of", self.AS_OF]
+        assert "kept     2" in plain(runner.invoke(app, args))
+        assert "kept     1" in plain(runner.invoke(app, [*args, "--updated-key", "mod"]))
+
+    def test_revisions_can_be_ignored(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE, "mod": self.AFTER},
+            {"id": "b", "content": "y", "published_at": self.AFTER, "mod": self.AFTER},
+        ])
+        args = ["check", path, "--as-of", self.AS_OF, "--updated-key", "mod"]
+        assert "kept     0" in plain(runner.invoke(app, args))
+        assert "kept     1" in plain(runner.invoke(app, [*args, "--revisions", "ignore"]))
+
+    def test_jsonl_is_accepted(self, tmp_path) -> None:
+        path = tmp_path / "corpus.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(r) for r in [
+                {"id": "a", "content": "x", "published_at": self.BEFORE},
+                {"id": "b", "content": "y", "published_at": self.AFTER},
+            ]),
+            encoding="utf-8",
+        )
+        assert "rows     2" in plain(runner.invoke(app, ["check", str(path), "--as-of", self.AS_OF]))
+
+    def test_a_wrapper_object_needs_a_results_key_when_ambiguous(self, tmp_path) -> None:
+        path = self.corpus(tmp_path, {
+            "items": [{"id": "a", "content": "x", "published_at": self.BEFORE}],
+            "related": [{"id": "b", "content": "y", "published_at": self.AFTER}],
+        })
+        assert runner.invoke(app, ["check", path, "--as-of", self.AS_OF]).exit_code == 2
+        ok = runner.invoke(app, ["check", path, "--as-of", self.AS_OF, "--results-key", "items"])
+        assert ok.exit_code == 0
+
+    def test_the_packaged_fixture_corpus_passes_its_own_check(self, tmp_path) -> None:
+        # Dogfooding: the corpora the project ships should look healthy to the
+        # tool the project ships.
+        from importlib import resources
+
+        path = tmp_path / "web.json"
+        path.write_text(
+            resources.files("chronoguard.fixtures.data").joinpath("web_corpus.json").read_text(),
+            encoding="utf-8",
+        )
+        out = plain(runner.invoke(app, [
+            "check", str(path), "--as-of", self.AS_OF,
+            "--published-key", "date", "--updated-key", "modified",
+            "--source-key", "url", "--content-key", "title",
+        ]))
+        assert "would not produce a meaningful run" not in out
+        assert "revised=1" in out
+
+
+class TestFailOn:
+    """Exit codes are the whole reason this is usable in CI.
+
+    Without them a red run and a green run look identical to a shell, and a
+    gate that can't fail gets run once by hand and then forgotten.
+    """
+
+    AS_OF = "2023-06-01T00:00:00Z"
+    BEFORE = "2023-01-15T00:00:00Z"
+    AFTER = "2023-09-15T00:00:00Z"
+
+    def corpus(self, tmp_path, rows):
+        path = tmp_path / "corpus.json"
+        path.write_text(json.dumps(rows), encoding="utf-8")
+        return str(path)
+
+    def all_past(self, tmp_path):
+        return self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE},
+            {"id": "b", "content": "y", "published_at": self.BEFORE},
+        ])
+
+    def straddling(self, tmp_path):
+        return self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE},
+            {"id": "b", "content": "y", "published_at": self.AFTER},
+        ])
+
+    def _wire(self, monkeypatch, **kwargs):
+        client = ScenarioClient(
+            [action("web_search", query="meridian price"), answer("Summer, no price yet.")],
+            claims=["Halden confirmed a summer window."],
+            **kwargs,
+        )
+        monkeypatch.setattr(cli, "OllamaClient", lambda **kw: client)
+        return client
+
+    # check
+
+    def test_check_defaults_to_never_failing(self, tmp_path) -> None:
+        assert runner.invoke(app, ["check", self.all_past(tmp_path), "--as-of", self.AS_OF]).exit_code == 0
+
+    def test_check_fails_on_an_error(self, tmp_path) -> None:
+        result = runner.invoke(
+            app, ["check", self.all_past(tmp_path), "--as-of", self.AS_OF, "--fail-on", "error"]
+        )
+        assert result.exit_code == cli.EXIT_THRESHOLD
+
+    def test_check_passes_a_healthy_corpus(self, tmp_path) -> None:
+        result = runner.invoke(
+            app, ["check", self.straddling(tmp_path), "--as-of", self.AS_OF, "--fail-on", "error"]
+        )
+        assert result.exit_code == 0, plain(result)
+
+    def test_check_warning_level_is_stricter_than_error(self, tmp_path) -> None:
+        # An unmapped revision field is a warning, not an error, so the same
+        # corpus passes one threshold and fails the other.
+        path = self.corpus(tmp_path, [
+            {"id": "a", "content": "x", "published_at": self.BEFORE, "last_modified": self.AFTER},
+            {"id": "b", "content": "y", "published_at": self.BEFORE, "last_modified": self.AFTER},
+            {"id": "c", "content": "z", "published_at": self.AFTER, "last_modified": self.AFTER},
+        ])
+        args = ["check", path, "--as-of", self.AS_OF, "--fail-on"]
+        assert runner.invoke(app, [*args, "error"]).exit_code == 0
+        assert runner.invoke(app, [*args, "warning"]).exit_code == cli.EXIT_THRESHOLD
+
+    def test_check_still_prints_the_report_when_it_fails(self, tmp_path) -> None:
+        result = runner.invoke(
+            app, ["check", self.all_past(tmp_path), "--as-of", self.AS_OF, "--fail-on", "error"]
+        )
+        assert "rows     2" in plain(result)
+
+    def test_check_json_output_survives_a_failure(self, tmp_path) -> None:
+        # A CI job wants the machine summary even on the run that failed it.
+        result = runner.invoke(app, [
+            "check", self.all_past(tmp_path), "--as-of", self.AS_OF,
+            "--fail-on", "error", "--json",
+        ])
+        assert result.exit_code == cli.EXIT_THRESHOLD
+        assert json.loads(plain(result).split("\n--fail-on")[0])["usable"] is False
+
+    def test_check_rejects_an_unknown_threshold(self, tmp_path) -> None:
+        result = runner.invoke(
+            app, ["check", self.all_past(tmp_path), "--fail-on", "maybe"]
+        )
+        assert result.exit_code == cli.EXIT_BAD_ARGUMENT
+
+    # report
+
+    def test_report_defaults_to_never_failing(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(app, ["report", "task", "--skip-probe", "--skip-claims"])
+        assert result.exit_code == 0
+
+    def test_report_fails_when_the_risk_reaches_the_threshold(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(
+            app, ["report", "task", "--skip-probe", "--skip-claims", "--fail-on", "low"]
+        )
+        assert result.exit_code == cli.EXIT_THRESHOLD
+
+    def test_report_passes_below_the_threshold(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(
+            app, ["report", "task", "--skip-probe", "--skip-claims", "--fail-on", "high"]
+        )
+        assert result.exit_code == 0, plain(result)
+
+    def test_report_names_the_risk_it_failed_on(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(
+            app, ["report", "task", "--skip-probe", "--skip-claims", "--fail-on", "low"]
+        )
+        assert "--fail-on low" in plain(result)
+
+    def test_report_still_prints_the_report_when_it_fails(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(
+            app, ["report", "task", "--skip-probe", "--skip-claims", "--fail-on", "low"]
+        )
+        assert "ChronoGuard report" in plain(result)
+
+    def test_report_json_out_is_written_even_on_a_failure(self, monkeypatch, tmp_path) -> None:
+        self._wire(monkeypatch)
+        target = tmp_path / "summary.json"
+        result = runner.invoke(app, [
+            "report", "task", "--skip-probe", "--skip-claims",
+            "--json-out", str(target), "--fail-on", "low",
+        ])
+        assert result.exit_code == cli.EXIT_THRESHOLD
+        assert json.loads(target.read_text())["task"] == "task"
+
+    def test_report_rejects_an_unknown_threshold(self, monkeypatch) -> None:
+        self._wire(monkeypatch)
+        result = runner.invoke(app, ["report", "task", "--fail-on", "catastrophic"])
+        assert result.exit_code == cli.EXIT_BAD_ARGUMENT
+
+    def test_a_bad_as_of_still_beats_fail_on(self, monkeypatch) -> None:
+        # Argument errors are exit 2, not exit 3. A misconfigured run is not
+        # the same as a run that came back badly.
+        self._wire(monkeypatch)
+        result = runner.invoke(app, ["report", "task", "--as-of", "2023-06-01", "--fail-on", "low"])
+        assert result.exit_code == cli.EXIT_BAD_ARGUMENT
+
+    def test_the_exit_codes_are_distinct(self) -> None:
+        codes = [cli.EXIT_OK, cli.EXIT_INFRASTRUCTURE, cli.EXIT_BAD_ARGUMENT, cli.EXIT_THRESHOLD]
+        assert codes == [0, 1, 2, 3]
+        assert len(set(codes)) == 4
+
+
+class TestBackendSelection:
+    """--backend picks the client, and everything downstream is unchanged."""
+
+    def test_ollama_is_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        built = {}
+        monkeypatch.setattr(cli, "OllamaClient", lambda **kw: built.setdefault("ollama", kw) or _Stub())
+        runner.invoke(app, ["models"])
+        assert "ollama" in built
+
+    def test_openai_compat_is_selectable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        built = {}
+        monkeypatch.setattr(
+            cli, "OpenAICompatClient", lambda url=None, **kw: built.setdefault("url", url) or _Stub()
+        )
+        runner.invoke(app, ["models", "--backend", "openai-compat", "--base-url", "http://x:8000"])
+        assert built["url"] == "http://x:8000"
+
+    def test_base_url_alone_implies_the_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Naming an OpenAI API root and getting an Ollama client is never what
+        # anyone meant.
+        built = {}
+        monkeypatch.setattr(
+            cli, "OpenAICompatClient", lambda url=None, **kw: built.setdefault("url", url) or _Stub()
+        )
+        monkeypatch.setattr(cli, "OllamaClient", lambda **kw: pytest.fail("should not build ollama"))
+        runner.invoke(app, ["models", "--base-url", "http://x:8000"])
+        assert built["url"] == "http://x:8000"
+
+    def test_an_unknown_backend_is_rejected(self) -> None:
+        result = runner.invoke(app, ["models", "--backend", "anthropic"])
+        assert result.exit_code != 0
+        assert "openai-compat" in plain(result)
+
+    def test_a_backend_failure_still_exits_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from chronoguard.backends import BackendUnavailable
+
+        def boom(url=None, **kw):
+            raise BackendUnavailable("nothing at http://x:8000/v1")
+
+        monkeypatch.setattr(cli, "OpenAICompatClient", boom)
+        result = runner.invoke(app, ["models", "--base-url", "http://x:8000"])
+        assert result.exit_code == cli.EXIT_INFRASTRUCTURE
+
+    def test_a_non_ollama_failure_does_not_say_ollama_serve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from chronoguard.backends import BackendUnavailable
+
+        def boom(url=None, **kw):
+            raise BackendUnavailable("nothing there")
+
+        monkeypatch.setattr(cli, "OpenAICompatClient", boom)
+        out = plain(runner.invoke(app, ["models", "--base-url", "http://x:8000"]))
+        assert "ollama serve" not in out
+        assert "--base-url" in out
+
+    def test_every_model_backed_command_takes_the_flag(self) -> None:
+        for command in ("models", "run", "probe", "report"):
+            assert "--backend" in plain(runner.invoke(app, [command, "--help"]))
+
+    def test_check_does_not_take_it(self) -> None:
+        # It never talks to a model, so offering a backend would be a lie.
+        assert "--backend" not in plain(runner.invoke(app, ["check", "--help"]))
+
+
+class _Stub:
+    """Minimal backend stand-in for the selection tests."""
+
+    host = "http://stub"
+
+    def list_models(self):
+        from chronoguard.backends import ModelInfo
+
+        return [ModelInfo(name="stub-model")]
+
+    def supports_tools(self, model: str) -> bool:
+        return False
+
+
+class TestCasesCommand:
+    """`chronoguard cases` is the other command that never needs a model."""
+
+    def write(self, tmp_path, cases):
+        path = tmp_path / "cases.json"
+        path.write_text(json.dumps({"cases": cases}), encoding="utf-8")
+        return str(path)
+
+    def case(self, case_id, knowable, question="q?", answer="zyzzyva"):
+        return {"id": case_id, "question": question, "answer": answer, "knowable_from": knowable}
+
+    def test_it_runs_with_no_ollama_at_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            cli, "OllamaClient", lambda **kw: pytest.fail("cases must not touch Ollama")
+        )
+        assert runner.invoke(app, ["cases"]).exit_code == 0
+
+    def test_it_reports_the_split(self) -> None:
+        out = plain(runner.invoke(app, ["cases", "--as-of", "2023-06-01T00:00:00Z"]))
+        assert "future" in out
+        assert "control" in out
+
+    def test_json_output_parses(self) -> None:
+        payload = json.loads(plain(runner.invoke(app, ["cases", "--json"])))
+        assert payload["future"] > 0
+        assert payload["usable"] is True
+
+    def test_a_late_as_of_reports_nothing_measurable(self) -> None:
+        # The packaged set runs out, which is exactly what this command is for.
+        out = plain(runner.invoke(app, ["cases", "--as-of", "2030-01-01T00:00:00Z"]))
+        assert "would not measure anything" in out
+
+    def test_a_custom_file_is_read(self, tmp_path) -> None:
+        path = self.write(tmp_path, [
+            self.case("mine-old", "2020-01-01T00:00:00Z"),
+            self.case("mine-new", "2024-01-01T00:00:00Z"),
+        ])
+        out = plain(runner.invoke(app, ["cases", "--cases", path, "--as-of", "2023-06-01T00:00:00Z"]))
+        assert "cases    2" in out
+        assert path in out
+
+    def test_a_bad_as_of_exits_two(self) -> None:
+        assert runner.invoke(app, ["cases", "--as-of", "2023-06-01"]).exit_code == 2
+
+    def test_a_missing_file_exits_two(self, tmp_path) -> None:
+        result = runner.invoke(app, ["cases", "--cases", str(tmp_path / "nope.json")])
+        assert result.exit_code == 2
+
+    def test_a_malformed_case_exits_two(self, tmp_path) -> None:
+        path = self.write(tmp_path, [{"id": "x", "question": "q?"}])
+        assert runner.invoke(app, ["cases", "--cases", path]).exit_code == 2
+
+    def test_fail_on_error_fires_when_nothing_is_measurable(self) -> None:
+        result = runner.invoke(
+            app, ["cases", "--as-of", "2030-01-01T00:00:00Z", "--fail-on", "error"]
+        )
+        assert result.exit_code == cli.EXIT_THRESHOLD
+
+    def test_fail_on_error_passes_a_healthy_set(self) -> None:
+        result = runner.invoke(
+            app, ["cases", "--as-of", "2023-06-01T00:00:00Z", "--fail-on", "error"]
+        )
+        assert result.exit_code == 0, plain(result)
+
+    def test_a_giveaway_is_reported(self, tmp_path) -> None:
+        path = self.write(tmp_path, [
+            self.case("old", "2020-01-01T00:00:00Z"),
+            self.case("leaky", "2024-01-01T00:00:00Z",
+                      question="Did Richard Sutton win?", answer="Richard Sutton"),
+        ])
+        out = plain(runner.invoke(app, ["cases", "--cases", path, "--as-of", "2023-06-01T00:00:00Z"]))
+        assert "spells out" in out
+        assert "leaky" in out
+
+    def test_the_packaged_set_ships_clean(self) -> None:
+        # No duplicate ids, no giveaways, and usable at the default as-of.
+        result = runner.invoke(
+            app, ["cases", "--as-of", "2023-06-01T00:00:00Z", "--fail-on", "warning"]
+        )
+        assert result.exit_code == 0, plain(result)

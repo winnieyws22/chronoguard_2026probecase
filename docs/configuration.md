@@ -18,7 +18,8 @@ midnight.
 ## TemporalGuard
 
 ```python
-TemporalGuard(as_of, *, policy=GuardPolicy.STRICT, allow_undated=False)
+TemporalGuard(as_of, *, policy=GuardPolicy.STRICT, allow_undated=False,
+              revisions=RevisionPolicy.REJECT)
 ```
 
 | Option | Default | Meaning |
@@ -26,9 +27,27 @@ TemporalGuard(as_of, *, policy=GuardPolicy.STRICT, allow_undated=False)
 | `as_of` | required | The instant being simulated. Aware datetime or ISO string with an offset. |
 | `policy` | `strict` | `strict` drops violations. `warn` keeps and flags them, for measuring how much a corpus *would* have leaked. |
 | `allow_undated` | `False` | Admit records with no usable publication timestamp. Covers missing, junk and timezone-naive dates together. |
+| `revisions` | `reject` | `reject` treats an `updated_at` at or after `as_of` as a violation. `ignore` filters on publication date only. |
 
 Records the `warn` policy lets through still count as violations, so
 `filtered_count` and `violation_count` are separate numbers.
+
+`policy` decides what the agent *sees*. `revisions` and `allow_undated` decide
+what counts as a violation in the first place, so `warn` and `strict` always
+reach the same verdict on the same record.
+
+### Verdicts
+
+| Verdict | Meaning |
+| --- | --- |
+| `allowed` | Published strictly before `as_of`, and not edited since. |
+| `future` | Published at or after `as_of`. |
+| `undated` | No publication timestamp. |
+| `unparseable` | A publication timestamp was supplied but isn't a usable instant. |
+| `revised` | Published before `as_of` but edited at or after it. |
+
+A record with no `updated_at` can never be `revised`, so nothing changes on an
+existing corpus until an adapter names the field.
 
 ## EvidenceRecord
 
@@ -36,10 +55,17 @@ Records the `warn` policy lets through still count as violations, so
 | --- | --- | --- |
 | `content` | required | The text the agent will see. |
 | `source_id` | required | Stable id: a URL, a document id, a primary key. |
-| `published_at` | `None` | When the world could first have seen this. The only field filtered on. |
+| `published_at` | `None` | When the world could first have seen this. Filtered on. |
+| `updated_at` | `None` | When it was last revised. Filtered on unless `revisions="ignore"`. |
 | `retrieved_at` | `None` | When your pipeline fetched it. Never filtered on, audit only. |
 | `metadata` | `{}` | Anything else. `MappingAdapter` parks unconsumed fields here. |
 | `published_at_raw` | `None` | What a timestamp was before it failed to parse, kept for reporting. |
+| `updated_at_raw` | `None` | Same, for an unparseable revision timestamp. |
+
+Two derived properties: `is_revised` (an `updated_at` strictly later than
+`published_at`; equal stamps are an insert, not an edit) and `latest_instant`
+(the most recent moment the content is shown to have existed in its current
+form).
 
 `EvidenceRecord(...)` is strict and raises on a naive datetime.
 `EvidenceRecord.from_source(...)` is lenient, never raises, and takes an extra
@@ -50,8 +76,8 @@ Records the `warn` policy lets through still count as violations, so
 ```python
 MappingAdapter(*, content_key="content", source_key=("source_id", "id", "url"),
                published_key=("published_at", "published", "date"),
-               retrieved_key=None, results_key=None, metadata_keys=None,
-               assume_tz=None, separator="\n")
+               updated_key=None, retrieved_key=None, results_key=None,
+               metadata_keys=None, assume_tz=None, separator="\n")
 ```
 
 | Option | Meaning |
@@ -59,6 +85,7 @@ MappingAdapter(*, content_key="content", source_key=("source_id", "id", "url"),
 | `content_key` | One field, or several joined in order. Missing ones are skipped, so `("title", "snippet")` works on records that only have a title. |
 | `source_key` | One field or several candidates, first hit wins. Falls back to `record-<n>` when none are present. |
 | `published_key` | Same, for the publication timestamp. |
+| `updated_key` | Optional, off by default. Name it on any mutable source or the field lands in `metadata`, where the guard never looks. |
 | `retrieved_key` | Optional. |
 | `results_key` | For tools returning a wrapper like `{"matches": [...]}`. |
 | `metadata_keys` | Which leftovers to keep. Default keeps everything unconsumed. |
@@ -77,6 +104,16 @@ guarded_tool(guard, adapter=None, *, name=None, audit=None, render=None)   # dec
 | `name` | the function's name | Name used in the audit log and tool schema. |
 | `audit` | a fresh log | Share one across every tool an agent gets, or run-level counts will be empty. |
 | `render` | returns `result.kept` | Turns the `FilterResult` into what the agent sees. Gets the whole result, so it can read what was dropped. |
+
+Wrapping an `async def` returns an awaitable, so you await the guarded tool
+exactly as you would have awaited the original. Filtering happens after the
+await, which means nothing is audited until the coroutine actually runs. A class
+whose `__call__` is async is handled too. Async generators are not supported.
+
+```python
+guarded = guard_tool(async_search, guard, adapter, audit=audit)
+kept = await guarded("meridian pricing")
+```
 
 ## AgentConfig
 
@@ -154,13 +191,22 @@ with no entry is `unknown`, which is never treated as safe.
 
 ```
 chronoguard version                  print the version
+chronoguard check CORPUS             what the guard would do to your data, no model
+chronoguard cases                    which probe questions apply at an as-of, no model
 chronoguard models                   list installed models and their tool support
 chronoguard run TASK                 one agent run against the fixture corpora
 chronoguard probe                    parametric leakage, no tools
 chronoguard report TASK              all three, plus a verdict
 ```
 
-Shared: `--host` (Ollama host), `--model`, `--as-of`.
+Shared: `--host` (Ollama host), `--model`, `--as-of`, `--backend`, `--base-url`.
+`check` and `cases` take none of those, because they never talk to a model.
+
+`check`: `--published-key`, `--updated-key`, `--source-key`, `--content-key`,
+`--results-key`, `--policy`, `--revisions`, `--allow-undated`, `--fail-on`,
+`--json`.
+
+`cases`: `--cases`, `--fail-on`, `--json`.
 
 `run`: `--mode`, `--max-steps`, `--policy`, `--json`.
 
@@ -168,17 +214,90 @@ Shared: `--host` (Ollama host), `--model`, `--as-of`.
 `--json`.
 
 `report`: `--judge`, `--mode`, `--policy`, `--max-steps`, `--max-claims`,
-`--max-future`, `--max-control`, `--skip-probe`, `--skip-claims`, `--json`,
-`--json-out PATH`.
+`--max-future`, `--max-control`, `--skip-probe`, `--skip-claims`, `--fail-on`,
+`--json`, `--json-out PATH`.
 
-Exit codes: `1` for an unreachable Ollama server, `2` for a bad argument such as
-an `as_of` without an offset.
+### Exit codes
+
+| Code | Means |
+| --- | --- |
+| `0` | Ran fine, nothing tripped a threshold. |
+| `1` | No Ollama server, or no models installed. |
+| `2` | Bad argument: an `as_of` without an offset, an unreadable corpus, an unknown policy. |
+| `3` | The command completed and `--fail-on` says the result is unacceptable. |
+
+`2` and `3` are separate on purpose. A misconfigured run and a run that came
+back badly are different events, and CI usually wants to shout about the first
+and gate on the second.
+
+### --fail-on
+
+Off by default (`never`) on both commands, so adding it breaks nothing.
+
+```bash
+chronoguard check corpus.json --as-of 2024-03-01T00:00:00Z --fail-on error
+chronoguard report "..." --fail-on elevated
+```
+
+`report` takes a risk level and fires when the headline risk reaches it or
+worse. The order is `low` < `unknown` < `elevated` < `high`, so gating on `low`
+also catches a run that couldn't measure something.
+
+`check` takes a finding severity, `error` or `warning`. An unmapped revision
+field is a warning rather than an error, so `warning` is the stricter setting.
+
+Output comes first either way. The report is printed and `--json-out` written
+before the threshold is checked, because the run that failed the build is the
+one whose output you need to read.
+
+## Backends
+
+ChronoGuard needs four things from a model server, and anything providing them
+works. Two ship:
+
+```bash
+chronoguard report "..."                                   # ollama, the default
+chronoguard report "..." --base-url http://localhost:8000  # anything OpenAI-compatible
+```
+
+| Backend | Use for | Selected by |
+| --- | --- | --- |
+| `ollama` | A local Ollama server. The default. | nothing, or `--backend ollama` |
+| `openai-compat` | vLLM, LM Studio, llama.cpp's server, text-generation-webui, OpenRouter, hosted APIs. | `--backend openai-compat`, or just `--base-url` |
+
+`--base-url` selects `openai-compat` on its own, since naming an OpenAI API root
+and getting an Ollama client is never what anyone meant. It accepts the root with
+or without the `/v1` suffix.
+
+```python
+from chronoguard import OpenAICompatClient, ScenarioConfig, run_scenario
+
+client = OpenAICompatClient("http://localhost:8000", tool_models={"Qwen/Qwen2.5-7B-Instruct"})
+report = run_scenario(ScenarioConfig(task="...", as_of="..."), client=client)
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `base_url` | `OPENAI_BASE_URL`, then `http://localhost:8000/v1` | API root, `/v1` optional. |
+| `api_key` | `OPENAI_API_KEY` | Bearer token. No header is sent without one, which is what local servers want. |
+| `timeout` | `600.0` | Seconds per request. |
+| `tool_models` | `True` | Which models get real tool definitions. `True` for all, `False` for none, or a set of names. There's no capability endpoint in this API, so this is a declaration rather than something discoverable. |
+
+Writing your own backend means satisfying `ChatBackend`: `chat`, `pick_model`,
+`supports_tools`, `list_models`, `model_names`, `is_available`, and a `host`
+attribute. Raise `BackendUnavailable`, or `BackendTimeout` when the server is up
+and the model is just slow.
 
 ## Environment
 
-`OLLAMA_HOST` sets the default Ollama host. The scheme is optional, so
-`localhost:11434` and `http://localhost:11434` both work. Defaults to
-`http://localhost:11434`.
+| Variable | Used by | Default |
+| --- | --- | --- |
+| `OLLAMA_HOST` | `OllamaClient` | `http://localhost:11434` |
+| `OPENAI_BASE_URL` | `OpenAICompatClient` | `http://localhost:8000/v1` |
+| `OPENAI_API_KEY` | `OpenAICompatClient` | none, and no header is sent |
+
+The scheme is optional everywhere, so `localhost:11434` and
+`http://localhost:11434` both work.
 
 ## Timeouts
 

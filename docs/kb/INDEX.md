@@ -15,7 +15,7 @@ is the point of splitting it up.
 
 Regenerate this file with `python scripts/build_kb_index.py`.
 
-48 notes.
+53 notes.
 
 ## concept
 
@@ -41,6 +41,7 @@ Choices that were made deliberately, with the reasoning. Do not reverse one with
 - [probe-has-a-control-group](probe-has-a-control-group.md) Zero leakage from a model that can't answer anything is not evidence of blinding.
 - [probe-questions-must-not-leak-answers](probe-questions-must-not-leak-answers.md) Questions naming the answer's defining attribute produce false leakage from models with no post-cutoff knowledge.
 - [prompt-is-not-containment](prompt-is-not-containment.md) The as-of line in the prompt keeps the model on task; the guard is what actually blocks the future.
+- [revision-dates-are-a-third-channel](revision-dates-are-a-third-channel.md) updated_at is filtered on by default, because publication date alone is not enough for mutable sources.
 - [undated-records-rejected-by-default](undated-records-rejected-by-default.md) No timestamp, junk timestamp or naive timestamp means rejected unless allow_undated is set.
 - [verdict-never-reports-unearned-clean](verdict-never-reports-unearned-clean.md) Two rules stop a spotless-looking run from reading as low risk.
 
@@ -49,10 +50,13 @@ Choices that were made deliberately, with the reasoning. Do not reverse one with
 Shapes and interfaces other code depends on.
 
 - [adapter-interface](adapter-interface.md) The three adapter kinds and when each applies.
+- [async-tools-are-awaited-then-filtered](async-tools-are-awaited-then-filtered.md) Wrapping an async def returns an awaitable; filtering happens inside it, after the await.
 - [audit-log-is-the-reporting-side](audit-log-is-the-reporting-side.md) Share one log across an agent's tools; that is where filtered counts come from.
+- [backend-protocol](backend-protocol.md) ChatBackend is the whole model-server surface; OllamaClient and OpenAICompatClient both satisfy it.
 - [claim-and-answer-matching](claim-and-answer-matching.md) Matching rules used by the probe, including the short-answer token rule.
 - [claim-label-meanings](claim-label-meanings.md) grounded, ungrounded-but-benign, suspected-parametric-leak, plus the unclassified escape hatch.
 - [evidence-record-contract](evidence-record-contract.md) Fields, the two constructors, and when to use which.
+- [exit-codes](exit-codes.md) What the shell sees from each command, and how a CI job gates on a run.
 - [groundedness-excludes-hedges](groundedness-excludes-hedges.md) Only grounded plus leaked claims count, so a hedge-heavy answer cannot look well grounded.
 - [guarded-tool-contract](guarded-tool-contract.md) What wrapping changes, what it preserves, and what not to wrap.
 - [numbers-are-matched-exactly](numbers-are-matched-exactly.md) fuzzy_match requires every digit run in a variant to appear, because one digit apart is a different fact.
@@ -68,6 +72,7 @@ How to carry out a specific task in this repo.
 - [add-a-guarded-tool](add-a-guarded-tool.md) Wrap any callable returning evidence so an agent only sees pre-as-of results.
 - [add-a-model-cutoff](add-a-model-cutoff.md) Edit model_cutoffs.json; matching is by family with longest-prefix fallback.
 - [add-a-probe-case](add-a-probe-case.md) Extend probe_cases.json or point at your own file.
+- [check-is-the-no-model-path](check-is-the-no-model-path.md) Run the guard over a corpus with no model, and read the two failure modes that look like success.
 - [run-the-test-suites](run-the-test-suites.md) Fast offline suite versus the Ollama-backed integration suite.
 - [tune-a-judge-prompt](tune-a-judge-prompt.md) Measure against known labels before and after; do not guess at prompt changes.
 
@@ -93,4 +98,4 @@ Traps, and bugs that already happened once.
 Orientation.
 
 - [module-map](module-map.md) One line per module and data file, in dependency order.
-- [repo-conventions](repo-conventions.md) Writing style, commit rules and test discipline; CLAUDE.md is the source of truth.
+- [repo-conventions](repo-conventions.md) Writing style, commit rules and test discipline for anyone touching this repo.

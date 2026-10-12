@@ -1,5 +1,5 @@
 {
-  "note_count": 48,
+  "note_count": 53,
   "types": [
     "concept",
     "contract",
@@ -22,7 +22,8 @@
       "links": [
         "evidence-record-contract",
         "guarded-tool-contract",
-        "add-a-guarded-tool"
+        "add-a-guarded-tool",
+        "revision-dates-are-a-third-channel"
       ],
       "source": "src/chronoguard/interception.py"
     },
@@ -39,7 +40,8 @@
       ],
       "links": [
         "canary-strings",
-        "fictional-fixture-scenario"
+        "fictional-fixture-scenario",
+        "revision-dates-are-a-third-channel"
       ],
       "source": "src/chronoguard/fixtures/data/"
     },
@@ -111,6 +113,24 @@
       "source": "src/chronoguard/agent.py"
     },
     {
+      "id": "async-tools-are-awaited-then-filtered",
+      "path": "async-tools-are-awaited-then-filtered.md",
+      "title": "Async tools are awaited first, then filtered",
+      "type": "contract",
+      "description": "Wrapping an async def returns an awaitable; filtering happens inside it, after the await.",
+      "tags": [
+        "interception",
+        "api",
+        "async"
+      ],
+      "links": [
+        "guarded-tool-contract",
+        "add-a-guarded-tool",
+        "audit-log-is-the-reporting-side"
+      ],
+      "source": "src/chronoguard/interception.py"
+    },
+    {
       "id": "audit-log-is-the-reporting-side",
       "path": "audit-log-is-the-reporting-side.md",
       "title": "Counts live on the AuditLog, not in the return value",
@@ -126,6 +146,24 @@
         "scenario-summary-schema"
       ],
       "source": "src/chronoguard/interception.py"
+    },
+    {
+      "id": "backend-protocol",
+      "path": "backend-protocol.md",
+      "title": "Any four-method client can drive ChronoGuard",
+      "type": "contract",
+      "description": "ChatBackend is the whole model-server surface; OllamaClient and OpenAICompatClient both satisfy it.",
+      "tags": [
+        "backends",
+        "api",
+        "ollama"
+      ],
+      "links": [
+        "adapter-interface",
+        "slow-model-is-not-an-absent-server",
+        "module-map"
+      ],
+      "source": "src/chronoguard/backends.py"
     },
     {
       "id": "boundary-rule-is-exclusive",
@@ -176,6 +214,24 @@
         "falsy-zero-limits"
       ],
       "source": "src/chronoguard/probe.py"
+    },
+    {
+      "id": "check-is-the-no-model-path",
+      "path": "check-is-the-no-model-path.md",
+      "title": "chronoguard check answers \"will this corpus work\" offline",
+      "type": "procedure",
+      "description": "Run the guard over a corpus with no model, and read the two failure modes that look like success.",
+      "tags": [
+        "cli",
+        "corpus",
+        "howto"
+      ],
+      "links": [
+        "test-that-the-raw-tool-leaks-first",
+        "revision-dates-are-a-third-channel",
+        "undated-records-rejected-by-default"
+      ],
+      "source": "src/chronoguard/preflight.py"
     },
     {
       "id": "circular-import-via-package-root",
@@ -291,9 +347,27 @@
       "links": [
         "adapter-interface",
         "naive-datetimes-are-not-instants",
-        "undated-records-rejected-by-default"
+        "undated-records-rejected-by-default",
+        "revision-dates-are-a-third-channel"
       ],
       "source": "src/chronoguard/evidence.py"
+    },
+    {
+      "id": "exit-codes",
+      "path": "exit-codes.md",
+      "title": "Exit codes, and why --fail-on defaults to never",
+      "type": "contract",
+      "description": "What the shell sees from each command, and how a CI job gates on a run.",
+      "tags": [
+        "cli",
+        "ci"
+      ],
+      "links": [
+        "check-is-the-no-model-path",
+        "scenario-summary-schema",
+        "verdict-never-reports-unearned-clean"
+      ],
+      "source": "src/chronoguard/cli.py"
     },
     {
       "id": "falsy-zero-limits",
@@ -356,7 +430,8 @@
       "links": [
         "adapter-interface",
         "audit-log-is-the-reporting-side",
-        "add-a-guarded-tool"
+        "add-a-guarded-tool",
+        "async-tools-are-awaited-then-filtered"
       ],
       "source": "src/chronoguard/interception.py"
     },
@@ -440,7 +515,9 @@
         "containment-vs-measurement",
         "repo-conventions",
         "circular-import-via-package-root",
-        "typer-collapses-single-command-apps"
+        "typer-collapses-single-command-apps",
+        "check-is-the-no-model-path",
+        "backend-protocol"
       ],
       "source": "src/chronoguard/"
     },
@@ -614,7 +691,7 @@
       "path": "repo-conventions.md",
       "title": "Repo conventions in one place",
       "type": "map",
-      "description": "Writing style, commit rules and test discipline; CLAUDE.md is the source of truth.",
+      "description": "Writing style, commit rules and test discipline for anyone touching this repo.",
       "tags": [
         "conventions",
         "orientation"
@@ -623,7 +700,25 @@
         "module-map",
         "run-the-test-suites"
       ],
-      "source": "CLAUDE.md"
+      "source": "docs/kb/repo-conventions.md"
+    },
+    {
+      "id": "revision-dates-are-a-third-channel",
+      "path": "revision-dates-are-a-third-channel.md",
+      "title": "A page edited after as_of leaks even when it was published before it",
+      "type": "decision",
+      "description": "updated_at is filtered on by default, because publication date alone is not enough for mutable sources.",
+      "tags": [
+        "guard",
+        "dates",
+        "evidence"
+      ],
+      "links": [
+        "boundary-rule-is-exclusive",
+        "undated-records-rejected-by-default",
+        "two-leakage-channels"
+      ],
+      "source": "src/chronoguard/guard.py"
     },
     {
       "id": "run-the-test-suites",
@@ -657,7 +752,8 @@
       ],
       "links": [
         "verdict-never-reports-unearned-clean",
-        "audit-log-is-the-reporting-side"
+        "audit-log-is-the-reporting-side",
+        "exit-codes"
       ],
       "source": "src/chronoguard/report.py"
     },
@@ -674,7 +770,8 @@
       ],
       "links": [
         "thinking-models-and-the-think-flag",
-        "run-the-test-suites"
+        "run-the-test-suites",
+        "backend-protocol"
       ],
       "source": "src/chronoguard/ollama.py"
     },
@@ -706,7 +803,8 @@
       ],
       "links": [
         "canary-strings",
-        "fictional-fixture-scenario"
+        "fictional-fixture-scenario",
+        "check-is-the-no-model-path"
       ],
       "source": "tests/test_fixture_tools.py"
     },
@@ -762,7 +860,7 @@
         "prompt-is-not-containment",
         "verdict-never-reports-unearned-clean"
       ],
-      "source": "DESIGN.md"
+      "source": "docs/kb/two-leakage-channels.md"
     },
     {
       "id": "typer-collapses-single-command-apps",
